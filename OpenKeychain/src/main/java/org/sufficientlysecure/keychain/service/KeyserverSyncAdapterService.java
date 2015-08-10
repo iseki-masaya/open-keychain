@@ -18,6 +18,9 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
+import android.os.Message;
+import android.os.Messenger;
+import android.os.PowerManager;
 import android.support.v4.app.NotificationCompat;
 
 import org.sufficientlysecure.keychain.Constants;
@@ -25,6 +28,7 @@ import org.sufficientlysecure.keychain.R;
 import org.sufficientlysecure.keychain.keyimport.ParcelableKeyRing;
 import org.sufficientlysecure.keychain.operations.ImportOperation;
 import org.sufficientlysecure.keychain.operations.results.ImportKeyResult;
+import org.sufficientlysecure.keychain.operations.results.OperationResult;
 import org.sufficientlysecure.keychain.provider.KeychainContract;
 import org.sufficientlysecure.keychain.provider.ProviderHelper;
 import org.sufficientlysecure.keychain.service.input.CryptoInputParcel;
@@ -33,61 +37,113 @@ import org.sufficientlysecure.keychain.ui.util.KeyFormattingUtils;
 import org.sufficientlysecure.keychain.util.Log;
 import org.sufficientlysecure.keychain.util.ParcelableProxy;
 import org.sufficientlysecure.keychain.util.Preferences;
+import org.sufficientlysecure.keychain.util.orbot.OrbotHelper;
 
 import java.util.ArrayList;
 import java.util.GregorianCalendar;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class KeyserverSyncAdapterService extends Service {
 
     private static final String ACTION_IGNORE_TOR = "ignore_tor";
+    private static final String ACTION_UPDATE_ALL = "update_all";
+    private static final String ACTION_DELAYED_UPDATE = "delayed_update";
+    private static final String ACTION_UPDATE_RESULT = "update_result";
     private static final String ACTION_DISMISS_NOTIFICATION = "cancel_sync";
     private static final String ACTION_START_ORBOT = "start_orbot";
+    private static final String ACTION_CANCEL = "cancel";
+
+    private static final String EXTRA_RESULT = "result";
+
+    private static AtomicBoolean sCancelled = new AtomicBoolean(false);
 
     @Override
-    public int onStartCommand(Intent intent, int flags, final int startId) {
-        Log.e("PHILIP", "Sync adapter service starting");
+    public int onStartCommand(final Intent intent, int flags, final int startId) {
+        Log.e("PHILIP", "Sync adapter service starting" + intent.getAction());
+
         NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        manager.cancel(Constants.Notification.KEYSERVER_SYNC_FAIL_ORBOT);
         switch (intent.getAction()) {
+            case ACTION_CANCEL: {
+                sCancelled.set(true);
+                break;
+            }
+
+            case ACTION_DELAYED_UPDATE: {
+                // TODO: PHILIP make time 5 minutes after testing
+                new Handler().postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        sCancelled.set(false);
+                        asyncKeyUpdate(KeyserverSyncAdapterService.this, new CryptoInputParcel());
+                    }
+                }, 10 * 1000);
+            }
+            case ACTION_UPDATE_ALL: {
+                sCancelled.set(false);
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        ImportKeyResult result = updateKeysFromKeyserver(
+                                KeyserverSyncAdapterService.this,
+                                new CryptoInputParcel()
+                        );
+                        handleUpdateResult(result);
+                    }
+                }).start();
+                break;
+            }
             case ACTION_IGNORE_TOR: {
-                updateKeysFromKeyserver(this,
-                        new CryptoInputParcel(ParcelableProxy.getForNoProxy()));
-                manager.cancel(Constants.Notification.KEYSERVER_SYNC_FAIL_ORBOT);
-                stopSelf(startId);
+                asyncKeyUpdate(this, new CryptoInputParcel(ParcelableProxy.getForNoProxy()));
                 break;
             }
             case ACTION_START_ORBOT: {
                 Intent startOrbot = new Intent(this, OrbotRequiredDialogActivity.class);
                 startOrbot.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                startOrbot.setAction(OrbotRequiredDialogActivity.ACTION_START_ORBOT);
-                startActivity(startOrbot);
-                new Handler().postDelayed(
-                        new Runnable() {
+                startOrbot.putExtra(OrbotRequiredDialogActivity.EXTRA_START_ORBOT, true);
+                Messenger messenger = new Messenger(
+                        new Handler() {
                             @Override
-                            public void run() {
-                                updateKeysFromKeyserver(KeyserverSyncAdapterService.this,
-                                        new CryptoInputParcel());
-                                stopSelf(startId);
+                            public void handleMessage(Message msg) {
+                                switch (msg.what) {
+                                    case OrbotRequiredDialogActivity.MESSAGE_ORBOT_STARTED: {
+                                        Log.e("PHILIP", "orbot activity returned");
+                                        asyncKeyUpdate(KeyserverSyncAdapterService.this,
+                                                new CryptoInputParcel());
+                                        break;
+                                    }
+                                    case OrbotRequiredDialogActivity.MESSAGE_ORBOT_IGNORE: {
+                                        asyncKeyUpdate(KeyserverSyncAdapterService.this,
+                                                new CryptoInputParcel(
+                                                        ParcelableProxy.getForNoProxy()));
+                                        break;
+                                    }
+                                    case OrbotRequiredDialogActivity.MESSAGE_DIALOG_CANCEL: {
+                                        // just stop service
+                                        stopSelf();
+                                        break;
+                                    }
+                                }
                             }
-                        },
-                        30000 // shouldn't take longer for orbot to start
+                        }
                 );
-
-                manager.cancel(Constants.Notification.KEYSERVER_SYNC_FAIL_ORBOT);
+                startOrbot.putExtra(OrbotRequiredDialogActivity.EXTRA_MESSENGER, messenger);
+                startActivity(startOrbot);
                 break;
             }
             case ACTION_DISMISS_NOTIFICATION: {
-                manager.cancel(Constants.Notification.KEYSERVER_SYNC_FAIL_ORBOT);
+                // notification is dismissed at the beginning
                 stopSelf(startId);
                 break;
             }
+
+            case ACTION_UPDATE_RESULT: {
+                handleUpdateResult((ImportKeyResult) intent.getParcelableExtra(EXTRA_RESULT));
+                break;
+            }
         }
-        // TODO: correct flag?
         return START_REDELIVER_INTENT;
     }
-
-    private static AtomicBoolean sCancelled = new AtomicBoolean(false);
 
     private class KeyserverSyncAdapter extends AbstractThreadedSyncAdapter {
 
@@ -100,7 +156,11 @@ public class KeyserverSyncAdapterService extends Service {
                                   ContentProviderClient provider, SyncResult syncResult) {
             Log.d(Constants.TAG, "Performing a keyserver sync!");
 
-            updateKeysFromKeyserver(KeyserverSyncAdapterService.this, new CryptoInputParcel());
+            // updateKeysFromKeyserver(KeyserverSyncAdapterService.this, new CryptoInputParcel());
+            Intent serviceIntent = new Intent(KeyserverSyncAdapterService.this,
+                    KeyserverSyncAdapterService.class);
+            serviceIntent.setAction(ACTION_UPDATE_ALL);
+            startService(serviceIntent);
         }
     }
 
@@ -109,8 +169,56 @@ public class KeyserverSyncAdapterService extends Service {
         return new KeyserverSyncAdapter().getSyncAdapterBinder();
     }
 
-    public static void updateKeysFromKeyserver(Context context,
-                                               CryptoInputParcel cryptoInputParcel) {
+    private void handleUpdateResult(ImportKeyResult result) {
+        if (result.isPending()) {
+            // result is pending due to Orbot not being started
+            // try to start it silently, if disabled show notificationaa
+            new OrbotHelper.SilentStartManager() {
+                @Override
+                protected void onOrbotStarted() {
+                    // retry the update
+                    updateKeysFromKeyserver(KeyserverSyncAdapterService.this,
+                            new CryptoInputParcel());
+                }
+
+                @Override
+                protected void onSilentStartDisabled() {
+                    // show notification
+                    NotificationManager manager =
+                            (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                    manager.notify(Constants.Notification.KEYSERVER_SYNC_FAIL_ORBOT,
+                            getOrbotNoification(KeyserverSyncAdapterService.this));
+                }
+            }.startOrbotAndListen(this, false);
+        } else if (result.cancelled()) {
+            Log.d(Constants.TAG, "Keyserver sync cancelled");
+            Log.e("PHILIP", "Keyserver sync cancelled");
+            // wait 5 minutes then try again
+            Intent serviceIntent = new Intent(KeyserverSyncAdapterService.this,
+                    KeyserverSyncAdapterService.class);
+            serviceIntent.setAction(ACTION_DELAYED_UPDATE);
+            startService(serviceIntent);
+        } else {
+            stopSelf();
+        }
+    }
+
+    private static void asyncKeyUpdate(final Context context,
+                                       final CryptoInputParcel cryptoInputParcel) {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                ImportKeyResult result = updateKeysFromKeyserver(context, cryptoInputParcel);
+                Intent intent = new Intent(context, KeyserverSyncAdapterService.class);
+                intent.setAction(ACTION_UPDATE_RESULT);
+                intent.putExtra(EXTRA_RESULT, result);
+                context.startService(intent);
+            }
+        }).start();
+    }
+
+    private static ImportKeyResult updateKeysFromKeyserver(final Context context,
+                                                           final CryptoInputParcel cryptoInputParcel) {
         /**
          * 1. Get keys which have been updated recently and therefore do not need to
          * be updated now
@@ -123,9 +231,12 @@ public class KeyserverSyncAdapterService extends Service {
         final int INDEX_UPDATED_KEYS_MASTER_KEY_ID = 0;
         final int INDEX_LAST_UPDATED = 1;
 
-        final long TIME_MAX = TimeUnit.DAYS.toSeconds(7);
-        final long CURRENT_TIME = GregorianCalendar.getInstance().get(GregorianCalendar.SECOND);
-        Log.e("PHILIP", "week: " + TIME_MAX);
+        // all time in seconds not milliseconds
+        // TODO: correct TIME_MAX after testing
+        // final long TIME_MAX = TimeUnit.DAYS.toSeconds(7);
+        final long TIME_MAX = 1;
+        final long CURRENT_TIME = GregorianCalendar.getInstance().getTimeInMillis() / 1000;
+        Log.e("PHILIP", "week: " + TIME_MAX + " current: " + CURRENT_TIME);
         Cursor updatedKeysCursor = context.getContentResolver().query(
                 KeychainContract.UpdatedKeys.CONTENT_URI,
                 new String[]{
@@ -161,7 +272,8 @@ public class KeyserverSyncAdapterService extends Service {
         );
 
         if (keyCursor == null) {
-            return;
+            return new ImportKeyResult(ImportKeyResult.RESULT_FAIL_NOTHING,
+                    new OperationResult.OperationLog());
         }
 
         ArrayList<ParcelableKeyRing> keyList = new ArrayList<>();
@@ -179,9 +291,9 @@ public class KeyserverSyncAdapterService extends Service {
         }
         keyCursor.close();
 
-        if (sCancelled.get()) {
-            // if we've already been cancelled
-            return;
+        if (isUpdateCancelled(context)) { // if we've already been cancelled
+            return new ImportKeyResult(OperationResult.RESULT_CANCELLED,
+                    new OperationResult.OperationLog());
         }
 
         // 3. Actually update the keys
@@ -192,27 +304,39 @@ public class KeyserverSyncAdapterService extends Service {
                         Preferences.getPreferences(context).getPreferredKeyserver()),
                 cryptoInputParcel
         );
-        if (result.isPending()) {
-            NotificationManager manager =
-                    (NotificationManager) context.getSystemService(NOTIFICATION_SERVICE);
-            manager.notify(Constants.Notification.KEYSERVER_SYNC_FAIL_ORBOT,
-                    getOrbotNoification(context));
 
+        if (result.isPending()) {
             Log.d(Constants.TAG, "Keyserver sync failed due to pending result " +
                     result.getRequiredInputParcel().mType);
         } else {
             Log.d(Constants.TAG, "Background keyserver sync completed: new " + result.mNewKeys
                     + " updated " + result.mUpdatedKeys + " bad " + result.mBadKeys);
         }
+        return result;
     }
 
-    public static void preventAndCancelUpdates() {
-        // TODO: PHILIP uncomment!
-        // sCancelled.set(true);
+    private static boolean isUpdateCancelled(Context context) {
+        PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        @SuppressWarnings("deprecation") // our min is API 15, deprecated only in 20
+                boolean isScreenOn = pm.isScreenOn();
+        return sCancelled.get() || isScreenOn;
     }
 
-    public static void allowUpdates() {
-        sCancelled.set(false);
+    /**
+     * will cancel an update already in progress
+     *
+     * @param context
+     */
+    public static void cancelUpdates(Context context) {
+        Intent intent = new Intent(context, KeyserverSyncAdapterService.class);
+        intent.setAction(ACTION_CANCEL);
+        context.startService(intent);
+    }
+
+    @Override
+    public void onDestroy() {
+        Log.e("PHILIP", "onDestroy");
+        super.onDestroy();
     }
 
     private static Notification getOrbotNoification(Context context) {
@@ -221,7 +345,8 @@ public class KeyserverSyncAdapterService extends Service {
         builder.setSmallIcon(R.drawable.ic_stat_notify_24dp)
                 .setLargeIcon(getBitmap(R.drawable.ic_launcher, context))
                 .setContentTitle(context.getString(R.string.keyserver_sync_orbot_notif_title))
-                .setContentText(context.getString(R.string.keyserver_sync_orbot_notif_msg));
+                .setContentText(context.getString(R.string.keyserver_sync_orbot_notif_msg))
+                .setAutoCancel(true);
 
         // In case the user decides to not use tor
         Intent ignoreTorIntent = new Intent(context, KeyserverSyncAdapterService.class);
@@ -261,7 +386,7 @@ public class KeyserverSyncAdapterService extends Service {
                 PendingIntent.FLAG_CANCEL_CURRENT
         );
 
-        builder.addAction(R.drawable.abc_ic_clear_mtrl_alpha,
+        builder.addAction(R.drawable.abc_ic_commit_search_api_mtrl_alpha,
                 context.getString(R.string.keyserver_sync_orbot_notif_start),
                 startOrbotPi
         );
